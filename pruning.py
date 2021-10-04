@@ -35,7 +35,7 @@ def bn_analyze(prunable_modules, save_path=None):
     max_val = np.abs(max_val)
     bn_val = sorted(bn_val)
     max_val = sorted(max_val)
-    plt.hist(bn_val, bins=101, align="mid", log=True, range=(0, 1.0))
+    plt.hist(bn_val, bins=101, align="mid")
     if save_path is not None:
         if os.path.isfile(save_path):
             os.remove(save_path)
@@ -48,18 +48,15 @@ def channel_prune(ori_model, example_inputs, output_transform, pruned_prob=0.3, 
 
     prunable_module_type = (nn.BatchNorm2d)
 
-    # ignore_idx = [230, 260, 290]
-
     prunable_modules = []
     for i, m in enumerate(model.modules()):
-        # if i in ignore_idx:
-        #     continue
         if isinstance(m, prunable_module_type):
             prunable_modules.append(m)
+
     ori_size = tp.utils.count_params(model)
-    DG = tp.DependencyGraph().build_dependency(model, example_inputs=example_inputs,
-                                               output_transform=output_transform)
-    bn_val, max_val = bn_analyze(prunable_modules, os.path.splitext(opt.save_path)[0] + "_before_pruning.jpg")
+    DG = tp.DependencyGraph().build_dependency(model, example_inputs=example_inputs, output_transform=output_transform)
+
+    bn_val, _ = bn_analyze(prunable_modules, os.path.splitext(opt.save_path)[0] + "_before_pruning.jpg")
     if thres is None:
         print('Recalculating thresh')
         thres_pos = int(pruned_prob * len(bn_val))
@@ -71,15 +68,8 @@ def channel_prune(ori_model, example_inputs, output_transform, pruned_prob=0.3, 
     for layer_to_prune in prunable_modules:
         # select a layer
         weight = layer_to_prune.weight.data.detach().cpu().numpy()
-        if isinstance(layer_to_prune, nn.Conv2d):
-            if layer_to_prune.groups > 1:
-                prune_fn = tp.prune_group_conv
-            else:
-                prune_fn = tp.prune_conv
-            L1_norm = np.sum(np.abs(weight), axis=(1, 2, 3))
-        elif isinstance(layer_to_prune, nn.BatchNorm2d):
-            prune_fn = tp.prune_batchnorm
-            L1_norm = np.abs(weight)
+        prune_fn = tp.prune_batchnorm
+        L1_norm = np.abs(weight)
 
         pos = np.array([i for i in range(len(L1_norm))])
         pruned_idx_mask = L1_norm < thres
@@ -87,11 +77,13 @@ def channel_prune(ori_model, example_inputs, output_transform, pruned_prob=0.3, 
         if len(prun_index) == len(L1_norm):
             del prun_index[np.argmax(L1_norm)]
 
-        plan = DG.get_pruning_plan(layer_to_prune, prune_fn, prun_index)
+        plan = DG.get_pruning_plan(layer_to_prune, tp.prune_batchnorm, prun_index)
         plan.exec()
 
     bn_analyze(prunable_modules, os.path.splitext(opt.save_path)[0] + "_after_pruning.jpg")
 
+    model.train()
+    ori_model.train()
     with torch.no_grad():
         out = model(example_inputs)
         out2 = ori_model(example_inputs)
@@ -102,13 +94,12 @@ def channel_prune(ori_model, example_inputs, output_transform, pruned_prob=0.3, 
         if isinstance(out, (list, tuple)):
             for o, o2 in zip(out, out2):
                 print("  Output: ", o.shape)
-                assert o.shape == o2.shape
+                assert o.shape == o2.shape, f'{o.shape} {o2.shape}'
         else:
             print("  Output: ", out.shape)
-            assert out.shape == out2.shape
+            assert out.shape == out2.shape, f'{o.shape} {o2.shape}'
         print("------------------------------------------------------\n")
     return model
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -116,6 +107,7 @@ if __name__ == '__main__':
     parser.add_argument('--save_path', default="", type=str, help='')
     parser.add_argument('-p', '--prob', default=0.5, type=float, help='pruning prob')
     parser.add_argument('-t', '--thres', default=0, type=float, help='pruning thres')
+    parser.add_argument('--shape', nargs='+', type=int, default=[1, 3, 640, 640])
     opt = parser.parse_args()
 
     weights = opt.weights
@@ -127,7 +119,7 @@ if __name__ == '__main__':
     device = torch.device('cpu')
     model = load_model(weights)
 
-    example_inputs = torch.zeros((1, 3, 640, 640), dtype=torch.float32).to()
+    example_inputs = torch.zeros(opt.shape, dtype=torch.float32).to(device)
     output_transform = None
     # for prob in [0, 0.01, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7]:
     if opt.thres != 0:
